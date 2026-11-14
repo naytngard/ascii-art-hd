@@ -36,7 +36,7 @@ Zip the `ascii-art-hd/` folder (or use the prebuilt `ascii-art-hd.skill`) and ad
 pip install -r requirements-dev.txt
 python -m pytest tests -q
 ```
-CI runs the same on Ubuntu and Windows (Python 3.9 and 3.12).
+CI runs the same on Ubuntu and Windows (Python 3.10 and 3.13).
 
 ## Limits
 - Needs a real source image/mesh; it converts, it does not invent.
