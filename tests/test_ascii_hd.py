@@ -168,7 +168,10 @@ def test_packaged_skill_matches_sources():
 
     with zipfile.ZipFile(ROOT / "ascii-art-hd.skill") as z:
         for rel in ("SKILL.md", "scripts/ascii_hd.py"):
-            assert z.read(f"ascii-art-hd/{rel}") == (ROOT / "ascii-art-hd" / rel).read_bytes(), \
+            def norm(b: bytes) -> bytes:  # Windows checkouts may use CRLF
+                return b.replace(b"\r\n", b"\n")
+
+            assert norm(z.read(f"ascii-art-hd/{rel}")) == norm((ROOT / "ascii-art-hd" / rel).read_bytes()), \
                 f"{rel} is stale in ascii-art-hd.skill - run python build_skill.py"
 
 
