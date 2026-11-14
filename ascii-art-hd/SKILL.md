@@ -19,10 +19,14 @@ Detailed ASCII art comes from **high resolution plus a real source**, not from c
    - `image` – one still picture.
    - `frames` – animated GIF or a folder of numbered frames.
    - `obj` – rotating turntable of a mesh (`--up z` for Blender exports, `--pitch` for camera tilt, `--frames` per full turn).
-3. **Start with a preview, not the final run.**
+3. **Start with a preview, not the final run.** Default to the *realistic* look: smooth light-and-shadow shading
+   only, no outline characters (`--edges 0`, the default). Outlines (`- | / \` along edges) make subjects look like
+   cartoons/comics; use `--edges` only when the user explicitly wants line art.
    ```
-   python scripts/ascii_hd.py image input.png --cols 200 --edges 0.35 --formats png,txt --out-dir out
+   python scripts/ascii_hd.py image input.png --cols 200 --formats png,txt --out-dir out
    ```
+   For animation, smoothness comes from more frames per loop (36–48) and constant contrast across frames, not from
+   a higher FPS.
    Then **look at the PNG** (view the image file). Do not judge the result from the text alone; text dumps lie about proportions and colour.
 4. **Tune, then re-render.** See the table below. Change one thing at a time.
 5. **Deliver** the formats the user needs and report what was produced, its size and the character count per frame.
@@ -31,8 +35,10 @@ Detailed ASCII art comes from **high resolution plus a real source**, not from c
 
 | Symptom | Change |
 |---|---|
-| Subject mushy / details lost | raise `--cols` (200–260), add `--edges 0.3`–`0.6`, lower `--gamma` slightly |
-| Too noisy / busy | lower `--cols`, set `--edges 0`, raise `--quant` |
+| Subject mushy / details lost | raise `--cols` (200–260), lower `--gamma` slightly, `--black-point 4` for more contrast |
+| Looks like a cartoon / comic outline | `--edges 0` (default); keep shading only |
+| User wants line art | `--edges 0.3`–`0.6` |
+| Too noisy / busy | lower `--cols`, raise `--quant` |
 | Dark subject disappears | lower `--bg-threshold` (e.g. 0.02), raise `--min-brightness` |
 | Background shows up as characters | raise `--bg-threshold` (0.08–0.15) |
 | Washed out | `--black-point 5 --white-point 98`, `--gamma 1.1` |
@@ -41,7 +47,7 @@ Detailed ASCII art comes from **high resolution plus a real source**, not from c
 | Dark text on light paper | `--invert --bg "#ffffff"` |
 | Rotating mesh looks flat | `--pitch 20–40`, make sure normals are sane; model Z-up → `--up z` |
 
-Tone mapping uses **measured ink density** of the chosen font, so brightness steps stay even. Contrast levels are computed once across all frames, so animations do not flicker.
+Tone mapping uses **measured ink density** of the chosen font, so brightness steps stay even. OBJ turntables are lit like a studio shot (key light, soft fill, sky term, specular highlight, gentle rim) so the form reads in 3D without outlines. Contrast levels are computed once across all frames, so animations do not flicker.
 
 ## Output formats (`--formats a,b,c`)
 

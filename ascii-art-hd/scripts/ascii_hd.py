@@ -377,6 +377,11 @@ def rotation(yaw: float, pitch: float) -> np.ndarray:
     return rx @ ry
 
 
+KEY_LIGHT = np.array([-0.45, 0.55, 0.70]) / np.linalg.norm([-0.45, 0.55, 0.70])
+FILL_LIGHT = np.array([0.6, -0.1, 0.5]) / np.linalg.norm([0.6, -0.1, 0.5])
+HALF_VEC = (KEY_LIGHT + np.array([0.0, 0.0, 1.0])) / np.linalg.norm(KEY_LIGHT + np.array([0.0, 0.0, 1.0]))
+
+
 def raster(v: np.ndarray, vn: np.ndarray, f: np.ndarray, W: int, H: int,
            base: np.ndarray, light: np.ndarray) -> Image.Image:
     scale = 0.46 * min(W, H)
@@ -407,12 +412,17 @@ def raster(v: np.ndarray, vn: np.ndarray, f: np.ndarray, W: int, H: int,
         n = w0[..., None] * vn[a] + w1[..., None] * vn[b] + w2[..., None] * vn[c]
         n /= np.maximum(np.linalg.norm(n, axis=2, keepdims=True), 1e-9)
         n = np.where((n[..., 2] < 0)[..., None], -n, n)          # two-sided shading
+        # realistic studio lighting: key + soft fill + sky term + Blinn specular + gentle rim (no outlines)
         diff = np.clip(n @ light, 0.0, 1.0)
-        rim = 0.30 * (1.0 - np.clip(n[..., 2], 0, 1)) ** 2
-        shade = np.clip(0.16 + 0.84 * diff + rim, 0.0, 1.0)
+        fill = 0.18 * np.clip(n @ FILL_LIGHT, 0.0, 1.0)
+        sky = 0.10 * (0.5 + 0.5 * n[..., 1])
+        spec = 0.35 * np.clip(n @ HALF_VEC, 0.0, 1.0) ** 40
+        rim = 0.18 * (1.0 - np.clip(n[..., 2], 0, 1)) ** 3
+        shade = np.clip(0.08 + 0.82 * diff + fill + sky + rim, 0.0, 1.2)
         zb[upd] = z[upd]
         tile = rgb[miny:maxy + 1, minx:maxx + 1]
-        tile[upd, :3] = np.clip(base[None, :] * shade[upd][:, None], 0, 255).astype(np.uint8)
+        lit = base[None, :] * shade[upd][:, None] + 255.0 * spec[upd][:, None]
+        tile[upd, :3] = np.clip(lit, 0, 255).astype(np.uint8)
         tile[upd, 3] = 255
     return Image.fromarray(rgb, "RGBA")
 
@@ -490,8 +500,7 @@ def cmd_obj(args) -> None:
         print(f"warning: {len(f)} triangles - rendering is pure NumPy and may take minutes", file=sys.stderr)
     vn = vertex_normals(v, f)
     base = np.array(hex_to_rgb(args.mesh_color), dtype=np.float64)
-    light = np.array([-0.45, 0.55, 0.70])
-    light /= np.linalg.norm(light)
+    light = KEY_LIGHT
     W = args.cols * 4
     H = int(W * args.ratio)
     pitch = math.radians(args.pitch)
@@ -506,7 +515,7 @@ def cmd_obj(args) -> None:
     run_pictures(images, args, args.fps or 12.0)
 
 
-def main() -> None:
+def main(argv: Optional[Sequence[str]] = None) -> None:
     ap = argparse.ArgumentParser(description="High-resolution colour ASCII art from images, GIFs and OBJ meshes.")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
@@ -532,7 +541,7 @@ def main() -> None:
     common_args(p)
     p.set_defaults(fn=cmd_obj)
 
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8")
     args.fn(args)
