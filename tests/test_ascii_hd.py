@@ -156,6 +156,178 @@ def test_obj_render_has_highlight_and_shadow(torus_obj):
     assert lum.max() > 220 and lum.min() < 60  # specular highlight and a real shadow side
 
 
+# ---------------------------------------------------------------- charset presets, crop, shadow lift, flood bg
+def cell_args(**over):
+    base = dict(cols=60, aspect=0.5, gamma=0.9, black_point=2.0, white_point=99.0, bg_threshold=0.06,
+                invert=False, edges=0.0, color="source", saturation=1.15, min_brightness=0.28, quant=8)
+    base.update(over)
+    return ah.argparse.Namespace(**base)
+
+
+def sphere_image() -> Image.Image:
+    H = W = 240
+    y, x = np.mgrid[0:H, 0:W]
+    r = 90
+    d2 = (x - 120) ** 2 + (y - 120) ** 2
+    nz = np.sqrt(np.clip(1 - d2 / r ** 2, 0, 1))
+    light = np.clip(-0.5 * (x - 120) / r - 0.6 * (y - 120) / r + 0.65 * nz, 0, 1)
+    img = np.zeros((H, W, 3), np.float32)
+    m = d2 < r * r
+    img[m] = np.stack([0.9 * light, 0.7 * light, 0.4 * light], -1)[m]
+    return Image.fromarray((img * 255).astype(np.uint8))
+
+
+def test_legacy_behaviour_is_unchanged_with_new_options_off():
+    """Golden hashes recorded from the code before --shadow-lift/--crop/--bg-mode existed (fixed ramp, no fonts)."""
+    import hashlib
+
+    ramp, dens = list(" .:-=+*#%@"), np.linspace(0, 1, 10).astype(np.float32)
+    for extra in ({}, dict(shadow_lift=0.0, bg_mode="threshold", crop=None, autocrop=False)):
+        cells = ah.image_to_cells(sphere_image(), cell_args(**extra), ramp, dens)
+        assert hashlib.sha256("\n".join(cells.rows).encode()).hexdigest() == \
+            "7899bac1c3b120f332f8011ae2dafeac8da8d240be5e4993a60ff883f02477f3"
+        assert hashlib.sha256(cells.colors.tobytes()).hexdigest() == \
+            "65de0a27b16fd6f235e7228184a4a4eb6fd1677797d1b6c6bc04447a9f05eee5"
+
+
+def test_charset_presets():
+    assert ah.resolve_charset("smooth") == " .:;+*%#$@" and ah.resolve_charset("DETAILED") == ah.DEFAULT_CHARSET
+    assert ah.resolve_charset("ab ") == "ab " and ah.resolve_charset("") == " .:;+*%#$@"
+    chars, _ = ah.build_ramp("smooth")
+    assert set(chars) == set(" .:;+*%#$@") and chars[0] == " "
+    chars, _ = ah.build_ramp("detailed")
+    assert set(chars) == set(ah.DEFAULT_CHARSET)
+
+
+def test_cli_default_charset_is_smooth_and_detailed_is_selectable(tmp_path, sphere_png):
+    out = tmp_path / "o"
+    run("image", sphere_png, "--cols", 80, "--formats", "txt", "--out-dir", out, "--name", "d")
+    default_txt = (out / "d.txt").read_text(encoding="utf-8")
+    assert set(default_txt) <= set(" .:;+*%#$@\n")          # no letters or digits -> no "text soup"
+    run("image", sphere_png, "--cols", 80, "--formats", "txt", "--out-dir", out, "--name", "s", "--charset", "smooth")
+    assert (out / "s.txt").read_text(encoding="utf-8") == default_txt
+    run("image", sphere_png, "--cols", 80, "--formats", "txt", "--out-dir", out, "--name", "det", "--charset", "detailed")
+    run("image", sphere_png, "--cols", 80, "--formats", "txt", "--out-dir", out, "--name", "lit",
+        "--charset", ah.DEFAULT_CHARSET, "--shadow-lift", 0)
+    detailed = (out / "det.txt").read_text(encoding="utf-8")
+    assert detailed == (out / "lit.txt").read_text(encoding="utf-8")   # preset == literal, lift 0 == off
+    assert detailed != default_txt and len(set(detailed)) > 20
+
+
+def test_parse_crop_validation():
+    assert ah.parse_crop("0.1,0,0.9,0.5") == (0.1, 0.0, 0.9, 0.5)
+    for bad in ("1,2,3", "a,b,c,d", "0.5,0,0.2,1", "0,0,1.5,1", "0,0.6,1,0.6"):
+        with pytest.raises(SystemExit):
+            ah.parse_crop(bad)
+
+
+def test_crop_matches_manually_cropped_input(tmp_path, sphere_png):
+    out = tmp_path / "o"
+    run("image", sphere_png, "--cols", 40, "--crop", "0.25,0,0.75,1", "--formats", "txt", "--out-dir", out, "--name", "c")
+    manual = tmp_path / "manual.png"
+    Image.open(sphere_png).crop((60, 0, 180, 240)).save(manual)
+    run("image", manual, "--cols", 40, "--formats", "txt", "--out-dir", out, "--name", "m")
+    got = (out / "c.txt").read_text(encoding="utf-8")
+    assert got == (out / "m.txt").read_text(encoding="utf-8")
+    assert len(got.splitlines()) == 40 and all(len(r) == 40 for r in got.splitlines())   # 120x240 px at --cols 40
+
+
+def blob_image(x0, y0, x1, y1, size=(200, 100)) -> Image.Image:
+    a = np.zeros((size[1], size[0], 3), np.uint8)
+    a[y0:y1, x0:x1] = (200, 160, 120)
+    return Image.fromarray(a)
+
+
+def test_autocrop_box_and_cli(tmp_path):
+    img = blob_image(80, 20, 120, 80)            # fractions x .4-.6, y .2-.8
+    box = ah.autocrop_box([img], ah.argparse.Namespace(**vars(cell_args(cols=100)), autocrop_pad=0.0))
+    assert abs(box[0] - 0.4) < 0.03 and abs(box[2] - 0.6) < 0.03 and abs(box[1] - 0.2) < 0.06 and abs(box[3] - 0.8) < 0.06
+    p = tmp_path / "b.png"
+    img.save(p)
+    out = tmp_path / "o"
+    run("image", p, "--cols", 30, "--autocrop", "--autocrop-pad", 0.05, "--formats", "txt", "--out-dir", out, "--name", "a")
+    rows = (out / "a.txt").read_text(encoding="utf-8").splitlines()
+    filled = [r for r in rows if r.strip()]
+    assert len(filled) >= len(rows) - 3                   # the blank border is gone (only the small pad remains)
+    run("image", p, "--cols", 30, "--formats", "txt", "--out-dir", out, "--name", "n")
+    plain = (out / "n.txt").read_text(encoding="utf-8").splitlines()
+
+    def fill(lines):
+        return sum(ch != " " for r in lines for ch in r) / sum(len(r) for r in lines)
+
+    assert fill(rows) > 0.7 and fill(plain) < 0.3         # without autocrop most of the canvas is empty
+
+
+def test_autocrop_blank_picture_keeps_everything():
+    blank = Image.new("RGB", (50, 50), (0, 0, 0))
+    assert ah.autocrop_box([blank], ah.argparse.Namespace(**vars(cell_args()), autocrop_pad=0.03)) == (0.0, 0.0, 1.0, 1.0)
+
+
+def test_frames_use_one_crop_box_covering_every_frame(tmp_path, ball_gif):
+    frames = [f.convert("RGBA") for f in ah.ImageSequence.Iterator(Image.open(ball_gif))]
+    args = ah.argparse.Namespace(**vars(cell_args(cols=120)), autocrop=True, crop=None, autocrop_pad=0.0)
+    cropped = ah.apply_crop(frames, args)
+    assert len({im.size for im in cropped}) == 1                       # same box -> same size
+    box = ah.autocrop_box(frames, args)
+    assert box[0] < 20 / 120 + 0.02 and box[2] > (20 + 75 + 18) / 120 - 0.02   # first and last ball position inside
+    out = tmp_path / "o"
+    run("frames", ball_gif, "--cols", 40, "--autocrop", "--formats", "txt", "--out-dir", out, "--name", "f")
+    frames_txt = (out / "f.txt").read_text(encoding="utf-8").split("\n===FRAME===\n")
+    assert len(frames_txt) == 6 and len({len(f.strip("\n").splitlines()) for f in frames_txt}) == 1
+
+
+def test_shadow_lift_curve():
+    x = np.linspace(0, 1, 101, dtype=np.float32)
+    assert np.array_equal(ah.lift_shadows(x, 0.0), x)
+    y = ah.lift_shadows(x, 1.0)
+    assert y[0] == 0.0 and math.isclose(float(y[-1]), 1.0, abs_tol=1e-6) and np.all(np.diff(y) >= 0)
+    assert y[5] > x[5] + 0.08                      # dark tones open up
+    assert y[90] - x[90] < 0.02                    # highlights stay put
+
+
+def test_shadow_lift_fills_dark_saturated_cloth():
+    a = np.zeros((100, 100, 3), np.uint8)
+    a[:, 30:] = (70, 8, 12)                        # dark red cloth, luminance ~0.08 (above the bg threshold)
+    a[:, :30] = (230, 220, 200)                    # bright strip so the levels are realistic
+    img = Image.fromarray(a)
+    ramp, dens = list(" .:-=+*#%@"), np.linspace(0, 1, 10).astype(np.float32)
+
+    def ink(lift):
+        c = ah.image_to_cells(img, cell_args(cols=40, shadow_lift=lift, min_brightness=0.0, quant=1), ramp, dens, levels=(0.0, 1.0))
+        cloth = [ramp.index(ch) for row in c.rows for ch in row[20:]]
+        return float(np.mean(cloth)), float(c.colors[:, 20:].mean())
+
+    ink0, col0 = ink(0.0)
+    ink1, col1 = ink(1.0)
+    assert ink1 > ink0 + 0.5 and col1 > col0       # denser characters and brighter colour
+
+
+def test_flood_background_removes_coloured_backdrop_only():
+    H, W = 120, 160
+    y, x = np.mgrid[0:H, 0:W]
+    img = np.zeros((H, W, 3), np.float32)
+    img[...] = np.stack([0.16 + 0.12 * x / W, 0.06 + 0 * x, 0.30 + 0.1 * y / H], -1)   # purple gradient backdrop
+    ring = ((x - 80) ** 2 + (y - 60) ** 2 < 45 ** 2)
+    img[ring] = (0.85, 0.75, 0.6)                                                     # bright subject
+    hole = ((x - 80) ** 2 + (y - 60) ** 2 < 14 ** 2)
+    img[hole] = (0.18, 0.06, 0.32)                                                    # backdrop-coloured, enclosed
+    im = Image.fromarray((img * 255).astype(np.uint8))
+    ramp, dens = list(" .:-=+*#%@"), np.linspace(0, 1, 10).astype(np.float32)
+    thr = ah.image_to_cells(im, cell_args(cols=80, bg_threshold=0.0), ramp, dens)
+    fl = ah.image_to_cells(im, cell_args(cols=80, bg_threshold=0.0, bg_mode="flood"), ramp, dens)
+    assert all(ch != " " for ch in thr.rows[0])                      # threshold mode keeps the whole backdrop
+    assert all(ch == " " for ch in fl.rows[0]) and all(ch == " " for ch in fl.rows[-1])
+    assert fl.rows[len(fl.rows) // 2][40] != " "                      # subject survives
+    assert fl.rows[len(fl.rows) // 2][len(fl.rows[0]) // 2] != " "     # enclosed backdrop-coloured hole is not reachable
+
+
+def test_new_options_end_to_end(tmp_path, sphere_png):
+    out = tmp_path / "o"
+    run("image", sphere_png, "--cols", 50, "--shadow-lift", 0.7, "--bg-mode", "flood", "--autocrop", "--crop", "0,0,1,1",
+        "--formats", "txt,png,json", "--out-dir", out, "--name", "all")
+    assert (out / "all.png").stat().st_size > 0
+
+
 def test_bad_obj_is_rejected(tmp_path):
     p = tmp_path / "empty.obj"
     p.write_text("# nothing\n", encoding="utf-8")

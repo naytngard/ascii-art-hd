@@ -7,7 +7,7 @@ description: Turn a picture, animated GIF, frame folder or 3D .obj mesh into hig
 
 Detailed ASCII art comes from **high resolution plus a real source**, not from clever character choice. Recognisable subjects (a horse's mane, armour, fur) need roughly 160–260 columns, per-character colour and a real picture or mesh underneath. A 50×24 hand-assembled blob of ellipsoids will never read as an animal; do not try to fix that with more shading characters.
 
-`scripts/ascii_hd.py` does the conversion. It needs only Python 3.9+, Pillow and NumPy (`pip install pillow numpy`).
+`scripts/ascii_hd.py` does the conversion. It needs only Python 3.10+, Pillow and NumPy (`pip install pillow numpy`).
 
 ## Workflow
 
@@ -39,6 +39,10 @@ Detailed ASCII art comes from **high resolution plus a real source**, not from c
 | Looks like a cartoon / comic outline | `--edges 0` (default); keep shading only |
 | User wants line art | `--edges 0.3`–`0.6` |
 | Too noisy / busy | lower `--cols`, raise `--quant` |
+| Letters/digits make small cells look like text | `--charset smooth` (default, ` .:;+*%#$@`); `--charset detailed` is the old 70-character set; or pass your own characters |
+| Person/portrait photo, subject small in frame | `--autocrop` (or `--crop x0,y0,x1,y1` as 0..1 fractions) - same box for every GIF frame |
+| Dark, saturated clothing stays sparse | `--shadow-lift 0.5`–`1` (opens dark tones, highlights untouched; 0 = off) |
+| Dark/coloured backdrop (not black) shows up | `--bg-mode flood` (removes similar-coloured cells connected to the border; `--bg-tolerance` 0.08–0.2) |
 | Dark subject disappears | lower `--bg-threshold` (e.g. 0.02), raise `--min-brightness` |
 | Background shows up as characters | raise `--bg-threshold` (0.08–0.15) |
 | Washed out | `--black-point 5 --white-point 98`, `--gamma 1.1` |
@@ -46,6 +50,12 @@ Detailed ASCII art comes from **high resolution plus a real source**, not from c
 | Looks stretched | `--aspect` must match the font (default 0.5 fits Consolas/Cascadia) |
 | Dark text on light paper | `--invert --bg "#ffffff"` |
 | Rotating mesh looks flat | `--pitch 20–40`, make sure normals are sane; model Z-up → `--up z` |
+
+**Person / portrait photo** (dark scene, coloured light) - recommended start:
+```
+python scripts/ascii_hd.py image person.jpg --cols 200 --autocrop --shadow-lift 0.6 --gamma 0.7 --min-brightness 0.45 --bg-threshold 0.10 --formats png,html,txt --out-dir out
+```
+Add `--bg-mode flood` if a coloured backdrop remains. Keep `--edges 0` (realistic shading, no outline).
 
 Tone mapping uses **measured ink density** of the chosen font, so brightness steps stay even. OBJ turntables are lit like a studio shot (key light, soft fill, sky term, specular highlight, gentle rim) so the form reads in 3D without outlines. Contrast levels are computed once across all frames, so animations do not flicker.
 

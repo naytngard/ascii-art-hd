@@ -13,11 +13,12 @@ Outputs (--formats): txt, ansi, html, png, json
   png   rendered preview of one frame (--png-frame)
   json  ASCII Mate .ascii.json (schema 2.0, palette of <= 62 colours)
 
-Needs: Python 3.9+, Pillow, NumPy.   No other dependencies.
+Needs: Python 3.10+, Pillow, NumPy.   No other dependencies.
 """
 from __future__ import annotations
 
 import argparse
+import copy
 import html as html_lib
 import json
 import math
@@ -36,6 +37,11 @@ FONT_CANDIDATES = [
     "LiberationMono-Regular.ttf", "cour.ttf", "Menlo.ttc", "Monaco.ttf",
 ]
 PALETTE_KEYS = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+# Presets for --charset. "smooth" has no letters/digits, so small cells read as shading, not as text.
+CHARSET_PRESETS = {
+    "smooth": " .:;+*%#$@",
+    "detailed": DEFAULT_CHARSET,
+}
 
 
 # ----------------------------------------------------------------------------
@@ -53,8 +59,14 @@ def load_font(size: int, path: Optional[str] = None) -> ImageFont.ImageFont:
         return ImageFont.load_default()
 
 
+def resolve_charset(value: str) -> str:
+    """'smooth' / 'detailed' (case-insensitive) -> preset; anything else is used as the literal characters."""
+    return CHARSET_PRESETS.get(value.strip().lower(), value) if value.strip() else CHARSET_PRESETS["smooth"]
+
+
 def build_ramp(charset: str, font_path: Optional[str] = None) -> Tuple[List[str], np.ndarray]:
     """Sort characters by how much ink they really put on a cell (measured, not guessed)."""
+    charset = resolve_charset(charset)
     font = load_font(24, font_path)
     chars = list(dict.fromkeys(charset))
     if " " not in chars:
@@ -98,26 +110,118 @@ def luminance(rgb: np.ndarray) -> np.ndarray:
     return rgb @ np.array([0.2126, 0.7152, 0.0722], dtype=np.float32)
 
 
-def measure_levels(img: Image.Image, args) -> Tuple[float, float]:
+def lift_shadows(lum: np.ndarray, amount: float) -> np.ndarray:
+    """Open up dark tones without touching highlights or pure black.
+
+    lum + 0.6*amount*sqrt(lum)*(1-lum)^2: zero stays zero, 1 stays 1, still monotonic for amount <= 1.
+    """
+    if amount <= 0:
+        return lum
+    lum = np.clip(lum, 0.0, 1.0)
+    return np.clip(lum + 0.6 * amount * np.sqrt(lum) * (1.0 - lum) ** 2, 0.0, 1.0)
+
+
+def flood_background(small: np.ndarray, tolerance: float) -> np.ndarray:
+    """Cells reachable from the picture border through similar-coloured neighbours (dark/coloured backdrops).
+
+    Reference colour = median of the border cells. A cell joins when it differs from the neighbour it is reached
+    from by <= tolerance and from the reference by <= 3*tolerance (RGB distance, 0..1 scale).
+    """
+    from collections import deque
+
+    rows, cols = small.shape[:2]
+    border = np.concatenate([small[0], small[-1], small[:, 0], small[:, -1]])
+    ref = np.median(border, axis=0)
+    near_ref = np.linalg.norm(small - ref, axis=2) <= 3 * tolerance
+    seen = np.zeros((rows, cols), dtype=bool)
+    todo: deque = deque()
+    for r, c in [(r, c) for r in (0, rows - 1) for c in range(cols)] + [(r, c) for c in (0, cols - 1) for r in range(rows)]:
+        if near_ref[r, c] and not seen[r, c]:
+            seen[r, c] = True
+            todo.append((r, c))
+    while todo:
+        r, c = todo.popleft()
+        for nr, nc in ((r - 1, c), (r + 1, c), (r, c - 1), (r, c + 1)):
+            if 0 <= nr < rows and 0 <= nc < cols and not seen[nr, nc] and near_ref[nr, nc] \
+                    and np.linalg.norm(small[nr, nc] - small[r, c]) <= tolerance:
+                seen[nr, nc] = True
+                todo.append((nr, nc))
+    return seen
+
+
+def cell_grid(img: Image.Image, args) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """(small RGB 0..1, lifted luminance, live mask) for the cell grid of one picture."""
     cols, rows = grid_size(img, args.cols, args.aspect)
     rgb, alpha = split_rgba(img)
     small = np.asarray(rgb.resize((cols, rows), Image.LANCZOS), dtype=np.float32) / 255
     a = np.asarray(alpha.resize((cols, rows), Image.LANCZOS), dtype=np.float32) / 255
     lum = luminance(small)
-    live = lum[(a > 0.5) & (lum >= args.bg_threshold)]
-    if live.size < 8:
+    live = (a > 0.5) & (lum >= args.bg_threshold)   # dark background -> empty cell (judged on the raw luminance)
+    if getattr(args, "bg_mode", "threshold") == "flood":
+        live &= ~flood_background(small, getattr(args, "bg_tolerance", 0.12))
+    return small, lift_shadows(lum, getattr(args, "shadow_lift", 0.0)), live
+
+
+def parse_crop(text: str) -> Tuple[float, float, float, float]:
+    try:
+        x0, y0, x1, y1 = (float(p) for p in text.split(","))
+    except ValueError:
+        raise SystemExit(f"--crop needs four comma-separated numbers x0,y0,x1,y1 (0..1), got {text!r}")
+    if not (0 <= x0 < x1 <= 1 and 0 <= y0 < y1 <= 1):
+        raise SystemExit("--crop needs 0 <= x0 < x1 <= 1 and 0 <= y0 < y1 <= 1")
+    return x0, y0, x1, y1
+
+
+def crop_fraction(img: Image.Image, box: Tuple[float, float, float, float]) -> Image.Image:
+    w, h = img.size
+    x0, y0 = int(round(box[0] * w)), int(round(box[1] * h))
+    x1, y1 = max(int(round(box[2] * w)), x0 + 1), max(int(round(box[3] * h)), y0 + 1)
+    return img.crop((x0, y0, min(x1, w), min(y1, h)))
+
+
+def autocrop_box(images: Sequence[Image.Image], args) -> Tuple[float, float, float, float]:
+    """Bounding box (fractions) of the live cells over ALL pictures, plus --autocrop-pad. Whole picture if empty."""
+    x0 = y0 = 1.0
+    x1 = y1 = 0.0
+    fine = copy.copy(args)
+    fine.cols = max(args.cols, 200)      # detect on a fine grid so a coarse --cols does not make the box sloppy
+    for im in images:
+        live = cell_grid(im, fine)[2]
+        cols_on = np.where(live.sum(axis=0) >= 2)[0]    # >= 2 cells: ignore lone specks
+        rows_on = np.where(live.sum(axis=1) >= 2)[0]
+        if cols_on.size and rows_on.size:
+            h, w = live.shape
+            x0, x1 = min(x0, cols_on[0] / w), max(x1, (cols_on[-1] + 1) / w)
+            y0, y1 = min(y0, rows_on[0] / h), max(y1, (rows_on[-1] + 1) / h)
+    if x1 <= x0 or y1 <= y0:
+        return 0.0, 0.0, 1.0, 1.0
+    pad = max(args.autocrop_pad, 0.0)
+    px, py = (x1 - x0) * pad, (y1 - y0) * pad
+    return max(x0 - px, 0.0), max(y0 - py, 0.0), min(x1 + px, 1.0), min(y1 + py, 1.0)
+
+
+def apply_crop(images: List[Image.Image], args) -> List[Image.Image]:
+    """--crop first, then --autocrop inside it; one box for every picture so animations stay registered."""
+    if getattr(args, "crop", None):
+        box = parse_crop(args.crop)
+        images = [crop_fraction(im, box) for im in images]
+    if getattr(args, "autocrop", False):
+        box = autocrop_box(images, args)
+        images = [crop_fraction(im, box) for im in images]
+    return images
+
+
+def measure_levels(img: Image.Image, args) -> Tuple[float, float]:
+    _, lum, live = cell_grid(img, args)
+    vals = lum[live]
+    if vals.size < 8:
         return 0.0, 1.0
-    lo, hi = np.percentile(live, [args.black_point, args.white_point])
+    lo, hi = np.percentile(vals, [args.black_point, args.white_point])
     return float(lo), float(max(hi, lo + 1e-3))
 
 
 def image_to_cells(img: Image.Image, args, ramp, dens, levels=None) -> Cells:
-    cols, rows = grid_size(img, args.cols, args.aspect)
-    rgb, alpha = split_rgba(img)
-    small = np.asarray(rgb.resize((cols, rows), Image.LANCZOS), dtype=np.float32) / 255
-    a = np.asarray(alpha.resize((cols, rows), Image.LANCZOS), dtype=np.float32) / 255
-    lum = luminance(small)
-    live = (a > 0.5) & (lum >= args.bg_threshold)   # dark background -> empty cell
+    small, lum, live = cell_grid(img, args)
 
     lo, hi = levels if levels else measure_levels(img, args)
     tone = np.clip((lum - lo) / (hi - lo), 0.0, 1.0) ** args.gamma
@@ -149,9 +253,10 @@ def image_to_cells(img: Image.Image, args, ramp, dens, levels=None) -> Cells:
         tint = np.array(hex_to_rgb(args.color[5:]), dtype=np.float32) / 255
         col = tone[..., None] * tint
     else:
-        col = small.copy()
-        gray = lum[..., None]
-        col = np.clip(gray + (col - gray) * args.saturation, 0, 1)
+        gray = luminance(small)[..., None]
+        col = np.clip(gray + (small - gray) * args.saturation, 0, 1)
+        if getattr(args, "shadow_lift", 0.0) > 0:       # same lift as the tone, hue preserved
+            col = np.clip(col * np.clip(lum[..., None] / np.maximum(gray, 1e-4), 1.0, 4.0), 0, 1)
     peak_ch = col.max(axis=2, keepdims=True)
     boost = np.maximum(peak_ch, args.min_brightness) / np.maximum(peak_ch, 1e-4)
     col = np.clip(col * boost, 0, 1)
@@ -442,7 +547,23 @@ def common_args(p: argparse.ArgumentParser) -> None:
     g.add_argument("--invert", action="store_true", help="swap light/dark (for dark text on light paper)")
     g.add_argument("--edges", type=float, default=0.0,
                    help="0 = off. 0.25-0.6 draws - | / \\ along strong edges (outlines, armour, strands)")
-    g.add_argument("--charset", default=DEFAULT_CHARSET, help="characters to use (sorted by measured ink)")
+    g.add_argument("--charset", default="smooth",
+                   help="smooth (default: ' .:;+*%%#$@', reads as shading) | detailed (70 characters, can look like "
+                        "text at small sizes) | or the literal characters to use (sorted by measured ink)")
+    g.add_argument("--shadow-lift", type=float, default=0.0,
+                   help="0..1 opens up dark tones (dark saturated clothing) without blowing highlights; 0 = off")
+    g.add_argument("--bg-mode", choices=["threshold", "flood"], default="threshold",
+                   help="threshold = cells darker than --bg-threshold are background (default); flood = also every "
+                        "similar-coloured cell connected to the picture border")
+    g.add_argument("--bg-tolerance", type=float, default=0.12,
+                   help="flood mode: max colour step between neighbouring background cells, 0..1 RGB (default 0.12)")
+    k = p.add_argument_group("crop")
+    k.add_argument("--crop", default=None, metavar="x0,y0,x1,y1",
+                   help="keep only this part of the picture, as fractions 0..1 (e.g. 0.2,0,0.8,1); same box for all frames")
+    k.add_argument("--autocrop", action="store_true",
+                   help="crop to the bounding box of the non-background cells (after --crop), same box for all frames")
+    k.add_argument("--autocrop-pad", type=float, default=0.03,
+                   help="margin added around the --autocrop box, as a fraction of its size (default 0.03)")
     c = p.add_argument_group("colour")
     c.add_argument("--color", default="source", help="source | mono | tint:#RRGGBB (default source)")
     c.add_argument("--saturation", type=float, default=1.15, help="colour saturation (default 1.15)")
@@ -462,6 +583,7 @@ def common_args(p: argparse.ArgumentParser) -> None:
 
 
 def run_pictures(images: List[Image.Image], args, fps: float) -> None:
+    images = apply_crop(images, args)
     ramp, dens = build_ramp(args.charset, args.font)
     per_frame = [measure_levels(im, args) for im in images]
     levels = (float(np.median([a for a, _ in per_frame])), float(np.median([b for _, b in per_frame])))
