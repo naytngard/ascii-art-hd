@@ -121,32 +121,27 @@ def lift_shadows(lum: np.ndarray, amount: float) -> np.ndarray:
     return np.clip(lum + 0.6 * amount * np.sqrt(lum) * (1.0 - lum) ** 2, 0.0, 1.0)
 
 
-def flood_background(small: np.ndarray, tolerance: float) -> np.ndarray:
-    """Cells reachable from the picture border through similar-coloured neighbours (dark/coloured backdrops).
+def flood_background(small: np.ndarray, tolerance: float, lum_max: float = 0.35) -> np.ndarray:
+    """Dim cells reachable from the picture border through similar-coloured neighbours (dark/coloured backdrops).
 
-    Reference colour = median of the border cells. A cell joins when it differs from the neighbour it is reached
-    from by <= tolerance and from the reference by <= 3*tolerance (RGB distance, 0..1 scale).
+    Every dim border cell (luminance < lum_max) seeds the fill with its own colour, so a dim panel touching the edge
+    is removed as well as the black floor. The fill spreads to a dim neighbour when their RGB distance is
+    <= tolerance (0..1 scale). Cells brighter than lum_max never join, so it cannot leak into a bright subject.
     """
-    from collections import deque
-
     rows, cols = small.shape[:2]
-    border = np.concatenate([small[0], small[-1], small[:, 0], small[:, -1]])
-    ref = np.median(border, axis=0)
-    near_ref = np.linalg.norm(small - ref, axis=2) <= 3 * tolerance
+    dim = luminance(small) < lum_max
+    edge_v = (np.linalg.norm(small[1:] - small[:-1], axis=2) <= tolerance) & dim[1:] & dim[:-1]
+    edge_h = (np.linalg.norm(small[:, 1:] - small[:, :-1], axis=2) <= tolerance) & dim[:, 1:] & dim[:, :-1]
     seen = np.zeros((rows, cols), dtype=bool)
-    todo: deque = deque()
-    for r, c in [(r, c) for r in (0, rows - 1) for c in range(cols)] + [(r, c) for c in (0, cols - 1) for r in range(rows)]:
-        if near_ref[r, c] and not seen[r, c]:
-            seen[r, c] = True
-            todo.append((r, c))
-    while todo:
-        r, c = todo.popleft()
-        for nr, nc in ((r - 1, c), (r + 1, c), (r, c - 1), (r, c + 1)):
-            if 0 <= nr < rows and 0 <= nc < cols and not seen[nr, nc] and near_ref[nr, nc] \
-                    and np.linalg.norm(small[nr, nc] - small[r, c]) <= tolerance:
-                seen[nr, nc] = True
-                todo.append((nr, nc))
-    return seen
+    seen[0], seen[-1], seen[:, 0], seen[:, -1] = dim[0], dim[-1], dim[:, 0], dim[:, -1]
+    while True:                          # vectorised propagation; stops when nothing new joins
+        before = int(seen.sum())
+        seen[1:] |= seen[:-1] & edge_v
+        seen[:-1] |= seen[1:] & edge_v
+        seen[:, 1:] |= seen[:, :-1] & edge_h
+        seen[:, :-1] |= seen[:, 1:] & edge_h
+        if int(seen.sum()) == before:
+            return seen
 
 
 def cell_grid(img: Image.Image, args) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -158,7 +153,7 @@ def cell_grid(img: Image.Image, args) -> Tuple[np.ndarray, np.ndarray, np.ndarra
     lum = luminance(small)
     live = (a > 0.5) & (lum >= args.bg_threshold)   # dark background -> empty cell (judged on the raw luminance)
     if getattr(args, "bg_mode", "threshold") == "flood":
-        live &= ~flood_background(small, getattr(args, "bg_tolerance", 0.12))
+        live &= ~flood_background(small, getattr(args, "bg_tolerance", 0.12), getattr(args, "bg_flood_max", 0.35))
     return small, lift_shadows(lum, getattr(args, "shadow_lift", 0.0)), live
 
 
@@ -179,20 +174,88 @@ def crop_fraction(img: Image.Image, box: Tuple[float, float, float, float]) -> I
     return img.crop((x0, y0, min(x1, w), min(y1, h)))
 
 
-def autocrop_box(images: Sequence[Image.Image], args) -> Tuple[float, float, float, float]:
-    """Bounding box (fractions) of the live cells over ALL pictures, plus --autocrop-pad. Whole picture if empty."""
+def live_components(live: np.ndarray, lum: np.ndarray) -> List[dict]:
+    """8-connected components of a boolean mask via row runs + union-find (no SciPy, fast on big grids).
+
+    Each component: {"box": (x0, y0, x1, y1) inclusive cell indices, "mass": sum of luminance, "size": cell count}.
+    """
+    parent: List[int] = []
+
+    def find(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    runs: List[Tuple[int, int, int]] = []          # (row, start, end) inclusive
+    by_row: List[List[int]] = []
+    for r in range(live.shape[0]):
+        padded = np.concatenate(([0], live[r].astype(np.int8), [0]))
+        d = np.diff(padded)
+        ids = []
+        for st, en in zip(np.where(d == 1)[0], np.where(d == -1)[0] - 1):
+            ids.append(len(runs))
+            parent.append(len(runs))
+            runs.append((r, int(st), int(en)))
+        by_row.append(ids)
+    for r in range(1, live.shape[0]):
+        for a in by_row[r - 1]:
+            for b in by_row[r]:
+                if runs[a][1] <= runs[b][2] + 1 and runs[b][1] <= runs[a][2] + 1:
+                    parent[find(a)] = find(b)
+    comps: dict = {}
+    for i, (r, st, en) in enumerate(runs):
+        c = comps.setdefault(find(i), {"box": [st, r, en, r], "mass": 0.0, "size": 0})
+        c["box"] = [min(c["box"][0], st), min(c["box"][1], r), max(c["box"][2], en), max(c["box"][3], r)]
+        c["mass"] += float(lum[r, st:en + 1].sum())
+        c["size"] += en - st + 1
+    return list(comps.values())
+
+
+def subject_box_cells(live: np.ndarray, lum: np.ndarray) -> Optional[Tuple[int, int, int, int]]:
+    """Box of the most prominent subject: the connected blob with the most light, plus near, non-trivial blobs.
+
+    A dim set piece or props elsewhere in the frame stay outside. Blobs of < 3 cells are specks and ignored.
+    """
+    comps = [c for c in live_components(live, lum) if c["size"] >= 3]
+    if not comps:
+        return None
+    main = max(comps, key=lambda c: c["mass"])
+    gap = max(2, int(round(0.03 * live.shape[1])))
+    x0, y0, x1, y1 = main["box"]
+    box = list(main["box"])
+    for c in comps:
+        if c is main or c["mass"] < 0.05 * main["mass"]:
+            continue
+        cx0, cy0, cx1, cy1 = c["box"]
+        if cx0 <= x1 + gap and cx1 >= x0 - gap and cy0 <= y1 + gap and cy1 >= y0 - gap:
+            box = [min(box[0], cx0), min(box[1], cy0), max(box[2], cx1), max(box[3], cy1)]
+    return tuple(box)
+
+
+def autocrop_box(images: Sequence[Image.Image], args, mode: Optional[str] = None) -> Tuple[float, float, float, float]:
+    """Bounding box (fractions) over ALL pictures plus --autocrop-pad; whole picture if nothing is found.
+
+    mode "subject" (default): the most prominent connected subject per picture (see subject_box_cells).
+    mode "all": every non-background cell (the former behaviour; also keeps dim set pieces).
+    """
+    mode = mode or ("all" if getattr(args, "autocrop", None) == "all" else "subject")
     x0 = y0 = 1.0
     x1 = y1 = 0.0
     fine = copy.copy(args)
     fine.cols = max(args.cols, 200)      # detect on a fine grid so a coarse --cols does not make the box sloppy
     for im in images:
-        live = cell_grid(im, fine)[2]
-        cols_on = np.where(live.sum(axis=0) >= 2)[0]    # >= 2 cells: ignore lone specks
-        rows_on = np.where(live.sum(axis=1) >= 2)[0]
-        if cols_on.size and rows_on.size:
-            h, w = live.shape
-            x0, x1 = min(x0, cols_on[0] / w), max(x1, (cols_on[-1] + 1) / w)
-            y0, y1 = min(y0, rows_on[0] / h), max(y1, (rows_on[-1] + 1) / h)
+        _, lum, live = cell_grid(im, fine)
+        h, w = live.shape
+        if mode == "all":
+            cols_on = np.where(live.sum(axis=0) >= 2)[0]    # >= 2 cells: ignore lone specks
+            rows_on = np.where(live.sum(axis=1) >= 2)[0]
+            cell_box = (cols_on[0], rows_on[0], cols_on[-1], rows_on[-1]) if cols_on.size and rows_on.size else None
+        else:
+            cell_box = subject_box_cells(live, lum)
+        if cell_box is not None:
+            x0, x1 = min(x0, cell_box[0] / w), max(x1, (cell_box[2] + 1) / w)
+            y0, y1 = min(y0, cell_box[1] / h), max(y1, (cell_box[3] + 1) / h)
     if x1 <= x0 or y1 <= y0:
         return 0.0, 0.0, 1.0, 1.0
     pad = max(args.autocrop_pad, 0.0)
@@ -553,15 +616,20 @@ def common_args(p: argparse.ArgumentParser) -> None:
     g.add_argument("--shadow-lift", type=float, default=0.0,
                    help="0..1 opens up dark tones (dark saturated clothing) without blowing highlights; 0 = off")
     g.add_argument("--bg-mode", choices=["threshold", "flood"], default="threshold",
-                   help="threshold = cells darker than --bg-threshold are background (default); flood = also every "
-                        "similar-coloured cell connected to the picture border")
+                   help="threshold = cells darker than --bg-threshold are background (default); flood = also every dim "
+                        "cell connected to the picture border (each border cell seeds with its own colour)")
     g.add_argument("--bg-tolerance", type=float, default=0.12,
                    help="flood mode: max colour step between neighbouring background cells, 0..1 RGB (default 0.12)")
+    g.add_argument("--bg-flood-max", type=float, default=0.35,
+                   help="flood mode: only cells darker than this luminance can become background, so the fill never "
+                        "leaks into a bright subject (default 0.35)")
     k = p.add_argument_group("crop")
     k.add_argument("--crop", default=None, metavar="x0,y0,x1,y1",
                    help="keep only this part of the picture, as fractions 0..1 (e.g. 0.2,0,0.8,1); same box for all frames")
-    k.add_argument("--autocrop", action="store_true",
-                   help="crop to the bounding box of the non-background cells (after --crop), same box for all frames")
+    k.add_argument("--autocrop", nargs="?", const="subject", default=None, choices=["subject", "all"],
+                   help="crop to the most prominent subject (largest bright connected blob + near blobs; dim set "
+                        "pieces stay out). '--autocrop all' = bounding box of every non-background cell. After "
+                        "--crop; same box for all frames")
     k.add_argument("--autocrop-pad", type=float, default=0.03,
                    help="margin added around the --autocrop box, as a fraction of its size (default 0.03)")
     c = p.add_argument_group("colour")

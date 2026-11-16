@@ -40,9 +40,9 @@ Detailed ASCII art comes from **high resolution plus a real source**, not from c
 | User wants line art | `--edges 0.3`–`0.6` |
 | Too noisy / busy | lower `--cols`, raise `--quant` |
 | Letters/digits make small cells look like text | `--charset smooth` (default, ` .:;+*%#$@`); `--charset detailed` is the old 70-character set; or pass your own characters |
-| Person/portrait photo, subject small in frame | `--autocrop` (or `--crop x0,y0,x1,y1` as 0..1 fractions) - same box for every GIF frame |
+| Person/portrait photo, subject small in frame | `--autocrop` (crops to the most prominent bright subject; dim set pieces/props stay out; `--autocrop all` = every non-background cell) or `--crop x0,y0,x1,y1` (0..1 fractions) - same box for every GIF frame |
 | Dark, saturated clothing stays sparse | `--shadow-lift 0.5`–`1` (opens dark tones, highlights untouched; 0 = off) |
-| Dark/coloured backdrop (not black) shows up | `--bg-mode flood` (removes similar-coloured cells connected to the border; `--bg-tolerance` 0.08–0.2) |
+| Dark/coloured backdrop (not black) shows up | `--bg-mode flood` (every dim border cell seeds a fill with its own colour, so dim panels touching the edge go too; `--bg-tolerance` 0.08–0.2 = colour step, `--bg-flood-max` 0.35 = brightness ceiling that keeps it out of the subject) |
 | Dark subject disappears | lower `--bg-threshold` (e.g. 0.02), raise `--min-brightness` |
 | Background shows up as characters | raise `--bg-threshold` (0.08–0.15) |
 | Washed out | `--black-point 5 --white-point 98`, `--gamma 1.1` |

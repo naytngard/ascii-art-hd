@@ -321,6 +321,68 @@ def test_flood_background_removes_coloured_backdrop_only():
     assert fl.rows[len(fl.rows) // 2][len(fl.rows[0]) // 2] != " "     # enclosed backdrop-coloured hole is not reachable
 
 
+def stage_scene(W=282, H=500) -> Image.Image:
+    """Black floor, bright person (35% of the width), dim blue-green panel touching the left edge, dim bags below."""
+    a = np.zeros((H, W, 3), np.float32)
+    px0, px1, py0, py1 = int(0.325 * W), int(0.675 * W), int(0.15 * H), int(0.85 * H)
+    ramp_x = np.linspace(0.85, 0.70, px1 - px0)[None, :, None]
+    a[py0:py1, px0:px1] = np.array([0.8, 0.5, 0.9])[None, None, :] * ramp_x          # lum ~0.5-0.6, with a gradient
+    a[int(0.2 * H):int(0.6 * H), 0:int(0.22 * W)] = (0.06, 0.20, 0.24)                # lum ~0.17
+    for cx in (0.3, 0.5, 0.7):
+        a[int(0.9 * H):int(0.96 * H), int((cx - 0.06) * W):int((cx + 0.06) * W)] = (0.12, 0.12, 0.14)
+    return Image.fromarray((a * 255).astype(np.uint8))
+
+
+def test_autocrop_picks_the_prominent_subject_not_the_dim_set():
+    img = stage_scene()
+    args = cell_args(cols=100, autocrop="subject", autocrop_pad=0.03)
+    box = ah.autocrop_box([img], args)
+    assert box[0] < 0.325 and box[2] > 0.675 and box[1] < 0.15 and box[3] > 0.85       # covers the whole person
+    assert box[2] - box[0] < 0.55                                                      # panel mostly outside
+    assert box[0] > 0.22                                                               # ...in fact entirely left of it
+    wide = ah.autocrop_box([img], cell_args(cols=100, autocrop="all", autocrop_pad=0.03))
+    assert wide[0] == 0.0 and wide[2] - wide[0] > 0.7 and wide[3] > 0.95             # old behaviour = everything
+    cropped = ah.apply_crop([img], cell_args(cols=100, autocrop=True, autocrop_pad=0.03, crop=None))[0]
+    assert cropped.size[0] < 0.55 * img.size[0]
+
+
+def test_autocrop_subject_includes_close_blobs_and_ignores_specks():
+    a = np.zeros((100, 200, 3), np.uint8)
+    a[10:90, 80:120] = (200, 200, 200)       # main
+    a[30:60, 125:140] = (90, 90, 90)         # close, dim neighbour (gap 5 px = 2.5% of the width)
+    a[2:4, 5:7] = (255, 255, 255)            # far speck
+    box = ah.autocrop_box([Image.fromarray(a)], cell_args(cols=200, autocrop="subject", autocrop_pad=0.0))
+    assert box[0] > 0.35 and box[2] > 0.69                                            # neighbour included
+    assert box[1] > 0.08                                                              # speck ignored
+
+
+def test_flood_removes_dim_edge_panel_and_keeps_the_person():
+    img = stage_scene()
+    ramp, dens = list(" .:-=+*#%@"), np.linspace(0, 1, 10).astype(np.float32)
+    args = cell_args(cols=80, bg_mode="flood")
+    cells = ah.image_to_cells(img, args, ramp, dens)
+    lit = cells.colors.any(axis=2)                       # live cells carry colour, background cells are (0,0,0)
+    rows, cols = lit.shape
+
+    def region(x0, x1, y0, y1):
+        return lit[int(y0 * rows):int(y1 * rows), int(x0 * cols):int(x1 * cols)]
+
+    panel = region(0.0, 0.22, 0.2, 0.6)
+    person = region(0.325, 0.675, 0.15, 0.85)
+    assert panel.mean() <= 0.10, f"panel still {panel.mean():.0%} drawn"
+    assert person.mean() >= 0.98, f"person only {person.mean():.0%} drawn"
+    threshold = ah.image_to_cells(img, cell_args(cols=80), ramp, dens).colors.any(axis=2)
+    assert threshold[int(0.2 * rows):int(0.6 * rows), 0:int(0.22 * cols)].mean() > 0.9    # without flood the panel stays
+
+
+def test_flood_ceiling_stops_leak_into_bright_subject():
+    a = np.full((60, 60, 3), 0.1, np.float32)
+    a[20:40, 20:40] = 0.5                                   # bright block, touching nothing dim by a sharp step
+    a[28:32, 28:32] = 0.1                                   # enclosed dim hole
+    fill = ah.flood_background(a, tolerance=0.5, lum_max=0.35)    # tolerance huge on purpose: only the ceiling guards
+    assert fill[0, 0] and not fill[30, 30] and not fill[25, 25]
+
+
 def test_new_options_end_to_end(tmp_path, sphere_png):
     out = tmp_path / "o"
     run("image", sphere_png, "--cols", 50, "--shadow-lift", 0.7, "--bg-mode", "flood", "--autocrop", "--crop", "0,0,1,1",

@@ -35,9 +35,9 @@ New-ish options worth knowing:
 | Option | What it does |
 |---|---|
 | `--charset smooth\|detailed\|<chars>` | `smooth` (default) = ` .:;+*%#$@`, reads as shading; `detailed` = 70 characters (can look like text when small) |
-| `--crop x0,y0,x1,y1` / `--autocrop` | crop by 0..1 fractions / to the non-background bounding box; one box for all frames |
+| `--crop x0,y0,x1,y1` / `--autocrop` | crop by 0..1 fractions / to the most prominent bright subject (dim set pieces stay out; `--autocrop all` = every non-background cell); one box for all frames |
 | `--shadow-lift 0..1` | opens dark tones (dark saturated clothing) without blowing highlights; 0 = off |
-| `--bg-mode flood` | also drops similar-coloured cells connected to the border (coloured/dark backdrops); `--bg-tolerance` |
+| `--bg-mode flood` | also drops dim cells connected to the border, each border cell seeding with its own colour (dim panels touching the edge); `--bg-tolerance` (colour step), `--bg-flood-max` (brightness ceiling, keeps the fill out of the subject) |
 
 Run `--help` on a sub-command for every option. Outputs: `txt`, `ansi`, `html` (animated), `png`, and `json` ([ASCII Mate](https://github.com/naytngard/ascii-mate) `.ascii.json`, palette ≤ 62 colours).
 
